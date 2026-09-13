@@ -10,7 +10,11 @@ import hashlib
 import hmac
 import struct
 import ctypes
-import ctypes.wintypes
+try:
+    import ctypes.wintypes
+except (ImportError, AttributeError):
+    # macOS/Linux doesn't have wintypes
+    pass
 
 # ============ Anti-Reverse Engineering ============
 
@@ -148,6 +152,14 @@ QCheckBox::indicator:checked:hover { background-color: #4285F4; border-color: #4
 
 def _res(rel=''):
     if hasattr(sys, '_MEIPASS'):
+        # macOS .app bundle: check Resources first, then fall back to _MEIPASS
+        if sys.platform == 'darwin':
+            exe_dir = os.path.dirname(sys.executable)
+            # sys.executable is in Contents/MacOS/, Resources is at Contents/Resources/
+            resources_dir = os.path.join(os.path.dirname(exe_dir), 'Resources')
+            resource_path = os.path.join(resources_dir, rel)
+            if os.path.exists(resource_path):
+                return resource_path
         return os.path.join(sys._MEIPASS, rel)
     return os.path.join(os.path.dirname(os.path.abspath(__file__)), rel)
 
@@ -1043,6 +1055,50 @@ class MainWindow(QWidget):
         self._watchdog.timeout.connect(lambda p=proc, lb=label: self._on_proc_timeout(p, lb))
         self._watchdog.start(timeout_ms)
 
+    def _launch_shell(self, script_path, args, on_exit, timeout_ms, label):
+        """启动 shell 脚本（macOS/Linux），带超时看门狗 + 输出捕获
+
+        Args:
+            script_path: 脚本路径
+            args: 传递给脚本的参数列表
+            on_exit: 退出回调
+            timeout_ms: 超时毫秒
+            label: 标签
+        """
+        old = self._proc
+        if old is not None and old.state() != QProcess.NotRunning:
+            old.kill()
+            old.waitForFinished(2000)
+        if self._watchdog is not None and self._watchdog.isActive():
+            self._watchdog.stop()
+        self._proc_output = ''
+        self._timed_out = False
+        proc = QProcess(self)
+        self._proc = proc
+        proc.setWorkingDirectory(_res())
+        proc.setProcessChannelMode(QProcess.MergedChannels)
+        proc.readyRead.connect(lambda p=proc: self._on_proc_read(p))
+        proc.errorOccurred.connect(lambda e, p=proc: self._on_proc_error(e, p, label))
+        proc.finished.connect(lambda c, s: self._on_proc_finished(on_exit, c, s, label))
+
+        # Make script executable
+        try:
+            os.chmod(script_path, os.stat(script_path).st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+        except Exception:
+            pass
+
+        # Combine script path and arguments
+        cmd_args = [script_path] + args
+        proc.start('/bin/bash', cmd_args)
+        if not proc.waitForStarted(8000):
+            self._set_buttons_enabled(True)
+            self._set_status(label + ' 启动失败', 'error')
+            return
+        self._watchdog = QTimer(self)
+        self._watchdog.setSingleShot(True)
+        self._watchdog.timeout.connect(lambda p=proc, lb=label: self._on_proc_timeout(p, lb))
+        self._watchdog.start(timeout_ms)
+
     def _on_proc_read(self, proc):
         try:
             txt = bytes(proc.readAll()).decode('utf-8', 'replace')
@@ -1334,21 +1390,27 @@ class MainWindow(QWidget):
 
     def _run_install(self, prompt_filename):
         base = _res()
-        install_ps1 = os.path.join(base, 'install.ps1')
+        install_script = os.path.join(base, 'install-codex.sh')
         prompt_path = os.path.join(base, prompt_filename)
+
         if not os.path.exists(prompt_path):
             self._set_status('找不到文件: ' + prompt_filename, 'error')
             return
-        if not os.path.exists(install_ps1):
-            self._set_status('找不到 install.ps1', 'error')
+        if not os.path.exists(install_script):
+            self._set_status(f'找不到 {os.path.basename(install_script)}', 'error')
             return
+
         self._set_status('正在安装 ' + prompt_filename + '...')
         self._set_buttons_enabled(False)
-        args = ['-File', install_ps1, '-SourcePrompt', prompt_path]
+
+        # Build arguments
+        args = [prompt_path]
         if prompt_filename == '寒霜v4.md':
-            args += ['-SkillsSource', 'codex-skills-v4']
-        self._launch_ps(args, lambda out, c, s, to: self._on_install_done(prompt_filename, c, s, out, to),
-                        self.INSTALL_TIMEOUT, '安装 ' + prompt_filename)
+            args.append('codex-skills-v4')
+
+        self._launch_shell(install_script, args,
+                         lambda out, c, s, to: self._on_install_done(prompt_filename, c, s, out, to),
+                         self.INSTALL_TIMEOUT, '安装 ' + prompt_filename)
 
     def _on_install_done(self, pf, ec, es, out, timed_out):
         self._set_buttons_enabled(True)
@@ -1377,23 +1439,25 @@ class MainWindow(QWidget):
 
     def _run_zcode_install(self, prompt_filename):
         base = _res()
-        install_ps1 = os.path.join(base, 'install-zcode.ps1')
+        # macOS uses .sh scripts
+        install_script = os.path.join(base, 'install-zcode.sh')
         prompt_filename = str(prompt_filename or '寒霜v4.md')
         prompt_path = os.path.join(base, prompt_filename)
-        if not os.path.exists(install_ps1):
-            self._set_status('找不到 install-zcode.ps1', 'error')
+        if not os.path.exists(install_script):
+            self._set_status('找不到 install-zcode.sh', 'error')
             return
         if not os.path.exists(prompt_path):
             self._set_status('找不到 ' + prompt_filename, 'error')
             return
         self._set_status('正在注入 ZCode（' + prompt_filename + '：提示词 + 记忆 + 系统提示词）...')
         self._set_buttons_enabled(False)
-        # 记忆内容与所选版本保持一致，避免提示词和记忆互相矛盾
-        args = ['-File', install_ps1, '-PatchSystemPrompt',
-                '-SourcePrompt', prompt_path, '-MemorySourcePrompt', prompt_path]
+
+        # Build shell script arguments
+        args = [prompt_path]
         if prompt_filename == '寒霜v4.md':
-            args += ['-SkillsSource', 'codex-skills-v4']
-        self._launch_ps(args,
+            args.append('codex-skills-v4')
+
+        self._launch_shell(install_script, args,
                         lambda out, c, s, to: self._on_zcode_install_done(prompt_filename, c, s, out, to),
                         self.INSTALL_TIMEOUT, 'ZCode 注入')
 
@@ -1451,22 +1515,28 @@ class MainWindow(QWidget):
 
     def _run_claude_install(self, prompt_filename):
         base = _res()
-        install_ps1 = os.path.join(base, 'install-claude.ps1')
-        prompt_filename = str(prompt_filename or '寒霜v3.md')
+        install_script = os.path.join(base, 'install-claude.sh')
+        prompt_filename = str(prompt_filename or '寒霜v4-claude.md')
         prompt_path = os.path.join(base, prompt_filename)
-        if not os.path.exists(install_ps1):
-            self._set_status('找不到 install-claude.ps1', 'error')
+
+        if not os.path.exists(install_script):
+            self._set_status(f'找不到 {os.path.basename(install_script)}', 'error')
             return
         if not os.path.exists(prompt_path):
             self._set_status('找不到 ' + prompt_filename, 'error')
             return
+
         self._set_status('正在注入 Claude（~/.claude/CLAUDE.md）...')
         self._set_buttons_enabled(False)
-        args = ['-File', install_ps1, '-SourcePrompt', prompt_path]
+
+        # Build arguments
+        args = [prompt_path]
         if prompt_filename == '寒霜v4-claude.md':
-            args += ['-SkillsSource', 'codex-skills-v4']
-        self._launch_ps(args, lambda out, c, s, to: self._on_claude_install_done(prompt_filename, c, s, out, to),
-                        self.INSTALL_TIMEOUT, 'Claude 注入')
+            args.append('codex-skills-v4')
+
+        self._launch_shell(install_script, args,
+                         lambda out, c, s, to: self._on_claude_install_done(prompt_filename, c, s, out, to),
+                         self.INSTALL_TIMEOUT, 'Claude 注入')
 
     def _on_claude_install_done(self, prompt_filename, ec, es, out, timed_out):
         self._set_buttons_enabled(True)
@@ -1484,18 +1554,18 @@ class MainWindow(QWidget):
 
     def _run_cursor_install(self, prompt_filename):
         base = _res()
-        install_ps1 = os.path.join(base, 'install-cursor.ps1')
+        install_script = os.path.join(base, 'install-cursor.sh')
         prompt_filename = str(prompt_filename or '寒霜v4.md')
         prompt_path = os.path.join(base, prompt_filename)
-        if not os.path.exists(install_ps1):
-            self._set_status('找不到 install-cursor.ps1', 'error')
+        if not os.path.exists(install_script):
+            self._set_status('找不到 install-cursor.sh', 'error')
             return
         if not os.path.exists(prompt_path):
             self._set_status('找不到 ' + prompt_filename, 'error')
             return
         self._set_status('正在注入 Cursor（全局 User Rules，新文件夹自动生效）...')
         self._set_buttons_enabled(False)
-        self._launch_ps(['-File', install_ps1, '-SourcePrompt', prompt_path],
+        self._launch_shell(install_script, [prompt_path],
                         lambda out, c, s, to: self._on_cursor_install_done(prompt_filename, c, s, out, to),
                         self.INSTALL_TIMEOUT, 'Cursor 注入')
 
@@ -1519,13 +1589,13 @@ class MainWindow(QWidget):
 
     def _uninstall_cursor(self):
         base = _res()
-        install_ps1 = os.path.join(base, 'install-cursor.ps1')
-        if not os.path.exists(install_ps1):
-            self._set_status('找不到 install-cursor.ps1', 'error')
+        install_script = os.path.join(base, 'install-cursor.sh')
+        if not os.path.exists(install_script):
+            self._set_status('找不到 install-cursor.sh', 'error')
             return
         self._set_status('正在卸载 Cursor 注入...')
         self._set_buttons_enabled(False)
-        self._launch_ps(['-File', install_ps1, '-Uninstall'],
+        self._launch_shell(install_script, ['--uninstall'],
                         lambda out, c, s, to: self._on_cursor_uninstall_done(c, s, out, to),
                         self.UNINSTALL_TIMEOUT, 'Cursor 卸载')
 
@@ -1544,13 +1614,13 @@ class MainWindow(QWidget):
 
     def _uninstall_claude(self):
         base = _res()
-        install_ps1 = os.path.join(base, 'install-claude.ps1')
-        if not os.path.exists(install_ps1):
-            self._set_status('找不到 install-claude.ps1', 'error')
+        install_script = os.path.join(base, 'install-claude.sh')
+        if not os.path.exists(install_script):
+            self._set_status('找不到 install-claude.sh', 'error')
             return
         self._set_status('正在卸载 Claude 注入...')
         self._set_buttons_enabled(False)
-        self._launch_ps(['-File', install_ps1, '-Uninstall'],
+        self._launch_shell(install_script, ['--uninstall'],
                         lambda out, c, s, to: self._on_claude_uninstall_done(c, s, out, to),
                         self.UNINSTALL_TIMEOUT, 'Claude 卸载')
 
@@ -1569,13 +1639,13 @@ class MainWindow(QWidget):
 
     def _uninstall_zcode(self):
         base = _res()
-        install_ps1 = os.path.join(base, 'install-zcode.ps1')
-        if not os.path.exists(install_ps1):
-            self._set_status('找不到 install-zcode.ps1', 'error')
+        install_script = os.path.join(base, 'install-zcode.sh')
+        if not os.path.exists(install_script):
+            self._set_status('找不到 install-zcode.sh', 'error')
             return
         self._set_status('正在卸载 ZCode 注入...')
         self._set_buttons_enabled(False)
-        self._launch_ps(['-File', install_ps1, '-Uninstall'],
+        self._launch_shell(install_script, ['--uninstall'],
                         lambda out, c, s, to: self._on_zcode_uninstall_done(c, s, out, to),
                         self.UNINSTALL_TIMEOUT, 'ZCode 卸载')
 
@@ -1601,21 +1671,21 @@ class MainWindow(QWidget):
 
     def _run_workbuddy_install(self, prompt_filename):
         base = _res()
-        install_ps1 = os.path.join(base, 'install-workbuddy.ps1')
+        install_script = os.path.join(base, 'install-workbuddy.sh')
         prompt_filename = str(prompt_filename or '寒霜v4.md')
         prompt_path = os.path.join(base, prompt_filename)
-        if not os.path.exists(install_ps1):
-            self._set_status('找不到 install-workbuddy.ps1', 'error')
+        if not os.path.exists(install_script):
+            self._set_status('找不到 install-workbuddy.sh', 'error')
             return
         if not os.path.exists(prompt_path):
             self._set_status('找不到 ' + prompt_filename, 'error')
             return
         self._set_status('正在注入 WorkBuddy 国际版（云记忆 memoryBlock + 文件记忆 + 技能库）...')
         self._set_buttons_enabled(False)
-        args = ['-File', install_ps1, '-SourcePrompt', prompt_path]
+        args = [prompt_path]
         if prompt_filename in ('寒霜v4.md', '寒霜v3.md'):
-            args += ['-SkillsSource', 'codex-skills-v4']
-        self._launch_ps(args,
+            args.append('codex-skills-v4')
+        self._launch_shell(install_script, args,
                         lambda out, c, s, to: self._on_workbuddy_install_done(prompt_filename, c, s, out, to),
                         self.INSTALL_TIMEOUT, 'WorkBuddy 注入')
 
@@ -1649,13 +1719,13 @@ class MainWindow(QWidget):
 
     def _uninstall_workbuddy(self):
         base = _res()
-        install_ps1 = os.path.join(base, 'install-workbuddy.ps1')
-        if not os.path.exists(install_ps1):
-            self._set_status('找不到 install-workbuddy.ps1', 'error')
+        install_script = os.path.join(base, 'install-workbuddy.sh')
+        if not os.path.exists(install_script):
+            self._set_status('找不到 install-workbuddy.sh', 'error')
             return
         self._set_status('正在卸载 WorkBuddy 注入（记忆 + 开关 + skills）...')
         self._set_buttons_enabled(False)
-        self._launch_ps(['-File', install_ps1, '-Uninstall'],
+        self._launch_shell(install_script, ['--uninstall'],
                         lambda out, c, s, to: self._on_workbuddy_uninstall_done(c, s, out, to),
                         self.UNINSTALL_TIMEOUT, 'WorkBuddy 卸载')
 
@@ -1771,13 +1841,16 @@ class MainWindow(QWidget):
 
     def _uninstall(self):
         base = _res()
-        install_ps1 = os.path.join(base, 'install.ps1')
-        if not os.path.exists(install_ps1):
-            self._set_status('找不到 install.ps1', 'error')
+        install_script = os.path.join(base, 'install-codex.sh')
+
+        if not os.path.exists(install_script):
+            self._set_status(f'找不到 {os.path.basename(install_script)}', 'error')
             return
+
         self._set_status('正在卸载...')
         self._set_buttons_enabled(False)
-        self._launch_ps(['-File', install_ps1, '-Uninstall'],
+
+        self._launch_shell(install_script, ['--uninstall'],
                         lambda out, c, s, to: self._on_uninstall_done(c, s, out, to),
                         self.UNINSTALL_TIMEOUT, 'Codex 卸载')
 

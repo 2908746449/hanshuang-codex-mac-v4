@@ -1,44 +1,29 @@
 # Python
+.venv/
+venv/
 __pycache__/
 *.py[cod]
 *$py.class
-.venv/
-venv/
-env/
+*.so
+.Python
 
-# Build artifacts
-dist/
-build_log*.txt
-
-# Backup files
-*.bak
-*.bak2
+# PyInstaller
 build/
-dist_nuitka/
-*.spec.bak
-*.spec.orig
-*.log
-*.db
-*.pyc
-*.pyo
+dist/
+*.spec
 
-# Runtime artifacts (generated, not version-controlled)
-logs/
-memory.json
-install-state.json
-
-# Environment
-.env
-.env.local
-
-# IDE
+# IDEs
 .vscode/
 .idea/
 *.swp
-*~
 *.swo
+*~
 
-# OS
+# macOS
 .DS_Store
-Thumbs.db
-desktop.ini
+.AppleDouble
+.LSOverride
+._*
+
+# Logs
+*.log
